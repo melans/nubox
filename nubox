@@ -1,0 +1,894 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1.0"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/config"
+
+# ============================================================================
+# Defaults (overridden by config)
+# ============================================================================
+
+BOXES_DIR="${SCRIPT_DIR}/BOXES"
+DEFAULT_USER=""
+DEFAULT_SUITE="stable"
+DEFAULT_MIRROR="http://deb.debian.org/debian"
+EXTRA_PACKAGES=""
+TS_AUTH_KEY=""
+TS_API_KEY=""
+INSTALL_CLAUDE=""
+INSTALL_OPENCLAW=""
+DEFAULT_TOKEN=""
+COPY_SSH_KEYS=""
+INSTALL_SSHD=""
+UNLIMITED_HISTORY="true"
+HISTTIMEFORMAT_FMT='%y%m%d.%H%M%S => '
+CUSTOM_BASHRC=""
+
+# Load config if exists
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Validate box name: alphanumeric, hyphens, underscores only
+validate_name() {
+    local name="$1"
+    [[ -z "$name" ]] && die "Name cannot be empty"
+    [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] || die "Invalid name '$name': use letters, numbers, hyphens, underscores only"
+    [[ ${#name} -le 64 ]] || die "Name too long (max 64 chars)"
+}
+
+# Get the username stored for a box
+box_user() {
+    cat "$BOXES_DIR/$1/.nubox-user" 2>/dev/null || echo "mr"
+}
+
+# Check if a box is running
+is_running() {
+    machinectl show "$1" 2>/dev/null | grep -q "State=running"
+}
+
+# Get leader PID of a running box
+leader_pid() {
+    sudo machinectl show "$1" -p Leader --value 2>/dev/null || echo ""
+}
+
+# ============================================================================
+# Usage
+# ============================================================================
+
+usage() {
+    cat <<EOF
+nubox $VERSION — disposable Debian machines
+
+USAGE:
+    nubox                              Interactive menu
+    nubox -n,  --new NAME             Create a new box
+    nubox -n,  --new NAME -t PROFILE  Create with token profile
+    nubox -n,  --new NAME -b [PATH]   Create and bind directory
+    nubox NAME                         Connect to box (boot if needed)
+    nubox -sh, --shell NAME           Shell into running box
+    nubox -on, --start NAME           Boot a stopped box
+    nubox -off,--stop NAME            Shutdown a running box
+    nubox -b,  --bind NAME [PATH]     Bind directory (restart if running)
+    nubox -ub, --unbind NAME [PATH]   Unbind directory
+    nubox -ls, --list                 List boxes with status
+    nubox -rm, --remove NAME [-y]     Remove box + cleanup
+    nubox -t,  --token                List token profiles
+    nubox -t,  --token NAME           Show token (masked)
+    nubox -t,  --token NAME TOKEN     Add/update token
+    nubox      --setup                Interactive first-time setup
+    nubox -h,  --help                 Show this help
+    nubox -v,  --version              Show version
+
+REQUIREMENTS:
+    debootstrap, systemd-container (systemd-nspawn)
+    Install: sudo apt install debootstrap systemd-container
+EOF
+}
+
+# ============================================================================
+# Interactive menu
+# ============================================================================
+
+interactive_menu() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "Welcome to nubox! No config found."
+        read -rp "Run setup? [Y/n] " ans
+        [[ "${ans:-y}" =~ ^[Nn]$ ]] && exit 0
+        cmd_setup
+        echo ""
+    fi
+
+    while true; do
+        echo ""
+        echo "nubox $VERSION"
+        echo ""
+        echo "  1) Create new box"
+        echo "  2) List boxes"
+        echo "  3) Connect to box"
+        echo "  4) Start box"
+        echo "  5) Stop box"
+        echo "  6) Remove box"
+        echo "  7) Token management"
+        echo "  8) Run setup"
+        echo "  9) Help"
+        echo "  0) Exit"
+        echo ""
+        read -rp "> " choice
+        case "$choice" in
+            1)
+                read -rp "Box name: " bname
+                [[ -z "$bname" ]] && continue
+                validate_name "$bname" || continue
+                read -rp "Token profile [${DEFAULT_TOKEN:-none}]: " tprof
+                cmd_new "$bname" "${tprof:-${DEFAULT_TOKEN:-}}"
+                ;;
+            2) cmd_list ;;
+            3)
+                cmd_list 2>/dev/null || true
+                read -rp "Box name: " bname
+                [[ -n "$bname" ]] && cmd_enter "$bname"
+                ;;
+            4)
+                cmd_list 2>/dev/null || true
+                read -rp "Box name: " bname
+                [[ -n "$bname" ]] && cmd_start "$bname"
+                ;;
+            5)
+                cmd_list 2>/dev/null || true
+                read -rp "Box name: " bname
+                [[ -n "$bname" ]] && cmd_stop "$bname"
+                ;;
+            6)
+                cmd_list 2>/dev/null || true
+                read -rp "Box name: " bname
+                [[ -n "$bname" ]] && cmd_remove "$bname"
+                ;;
+            7)
+                cmd_token
+                echo ""
+                read -rp "Add/update token? Name (or enter to skip): " tname
+                if [[ -n "$tname" ]]; then
+                    read -rp "Token: " tval
+                    [[ -n "$tval" ]] && cmd_token "$tname" "$tval"
+                fi
+                ;;
+            8) cmd_setup ;;
+            9) usage ;;
+            0|q|"") exit 0 ;;
+            *) echo "Invalid option" ;;
+        esac
+    done
+}
+
+# ============================================================================
+# Interactive setup
+# ============================================================================
+
+cmd_setup() {
+    echo ""
+    echo "nubox setup"
+    echo "==========="
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        read -rp "Config exists. Overwrite? [y/N] " ow
+        [[ ! "$ow" =~ ^[Yy]$ ]] && { echo "Keeping existing config."; return; }
+    fi
+
+    local boxes_dir user suite install_ssh install_ts install_ai
+    local ts_auth ts_api copy_keys
+
+    read -rp "Where to store boxes? [$BOXES_DIR] " boxes_dir
+    boxes_dir="${boxes_dir:-$BOXES_DIR}"
+
+    read -rp "Default username for boxes? [mr] " user
+    user="${user:-mr}"
+
+    read -rp "Debian suite? [stable] " suite
+    suite="${suite:-stable}"
+
+    read -rp "Install SSH server in boxes? [Y/n] " install_ssh
+    [[ "${install_ssh:-y}" =~ ^[Nn]$ ]] && install_ssh="" || install_ssh="true"
+
+    read -rp "Copy host SSH keys into boxes? [Y/n] " copy_keys
+    [[ "${copy_keys:-y}" =~ ^[Nn]$ ]] && copy_keys="" || copy_keys="true"
+
+    ts_auth=""
+    ts_api=""
+    read -rp "Set up Tailscale? (boxes join your network) [y/N] " install_ts
+    if [[ "${install_ts:-n}" =~ ^[Yy]$ ]]; then
+        echo ""
+        echo "  Get keys at: https://login.tailscale.com/admin/settings/keys"
+        echo "  Auth key: reusable key for machines to join"
+        echo "  API key: allows nubox to clean up on --remove"
+        echo ""
+        read -rp "  Auth key: " ts_auth
+        read -rp "  API key (optional): " ts_api
+    fi
+
+    local claude="" openclaw="" ai_token="" ai_name=""
+    read -rp "Install Claude Code in boxes? [y/N] " install_ai_c
+    [[ "${install_ai_c:-n}" =~ ^[Yy]$ ]] && claude="true"
+
+    read -rp "Install OpenClaw in boxes? [y/N] " install_ai_o
+    [[ "${install_ai_o:-n}" =~ ^[Yy]$ ]] && openclaw="true"
+
+    if [[ -n "$claude" || -n "$openclaw" ]]; then
+        read -rp "Auth token (from 'claude setup-token' or setup auth): " ai_token
+        read -rp "Token profile name: [personal] " ai_name
+        ai_name="${ai_name:-personal}"
+    fi
+
+    # Write config
+    cat > "$CONFIG_FILE" << CFGEOF
+# nubox config — generated by setup on $(date '+%Y-%m-%d %H:%M')
+
+# Where boxes live
+BOXES_DIR="$boxes_dir"
+
+# Box defaults
+DEFAULT_USER="$user"
+DEFAULT_SUITE="$suite"
+DEFAULT_MIRROR="http://deb.debian.org/debian"
+
+# Extra packages installed in every box (space-separated)
+# EXTRA_PACKAGES="git python3 wget"
+EXTRA_PACKAGES=""
+
+# SSH
+INSTALL_SSHD="$install_ssh"
+COPY_SSH_KEYS="$copy_keys"
+
+# Tailscale — boxes auto-join your network
+TS_AUTH_KEY="$ts_auth"
+TS_API_KEY="$ts_api"
+
+# AI Tools
+INSTALL_CLAUDE="$claude"
+INSTALL_OPENCLAW="$openclaw"
+
+# Auth tokens — same token used for Claude Code + OpenClaw
+# Add more with: nubox --token NAME TOKEN
+$([ -n "$ai_token" ] && echo "TOKEN_${ai_name}=\"${ai_token}\"" || echo "# TOKEN_personal=\"sk-ant-...\"")
+DEFAULT_TOKEN="${ai_name:-}"
+
+# History
+UNLIMITED_HISTORY="true"
+HISTTIMEFORMAT_FMT='%y%m%d.%H%M%S => '
+
+# Custom bashrc appended to every box (optional)
+# CUSTOM_BASHRC="/path/to/your/bashrc.custom"
+CFGEOF
+
+    mkdir -p "$boxes_dir"
+    echo ""
+    echo "Config saved to $CONFIG_FILE"
+    echo "Create your first box: nubox --new mybox"
+    source "$CONFIG_FILE"
+}
+
+# ============================================================================
+# Host networking
+# ============================================================================
+
+setup_host_network() {
+    local netfile="/etc/systemd/network/80-container-ve.network"
+    local sysctl_file="/etc/sysctl.d/99-nubox-forward.conf"
+
+    sudo sysctl -q -w net.ipv4.ip_forward=1
+    if ! systemctl is-active --quiet systemd-networkd; then
+        sudo systemctl enable --now systemd-networkd
+    fi
+
+    [[ -f "$netfile" ]] && [[ -f "$sysctl_file" ]] && return 0
+
+    echo "Setting up host networking..."
+    if [[ ! -f "$netfile" ]]; then
+        sudo tee "$netfile" > /dev/null <<'NETEOF'
+[Match]
+Kind=veth
+Name=ve-*
+
+[Network]
+Address=10.0.100.1/24
+DHCPServer=yes
+IPMasquerade=both
+LLDP=yes
+EmitLLDP=customer-bridge
+IPv6AcceptRA=no
+IPv6SendRA=yes
+NETEOF
+    fi
+
+    if [[ ! -f "$sysctl_file" ]]; then
+        echo "net.ipv4.ip_forward=1" | sudo tee "$sysctl_file" > /dev/null
+    fi
+
+    sudo systemctl restart systemd-networkd
+}
+
+# ============================================================================
+# Token management
+# ============================================================================
+
+cmd_token() {
+    local name="${1:-}"
+    local token="${2:-}"
+
+    # No args: list all profiles
+    if [[ -z "$name" ]]; then
+        echo "Token profiles:"
+        local found=0
+        if [[ -f "$CONFIG_FILE" ]]; then
+            while IFS= read -r line; do
+                line="${line## }"
+                [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+                if [[ "$line" =~ ^TOKEN_([a-zA-Z0-9_]+)= ]]; then
+                    local profile="${BASH_REMATCH[1]}"
+                    local val="${line#*=}"
+                    val="${val//\"/}"
+                    [[ -z "$val" ]] && continue
+                    local masked="${val:0:15}...${val: -4}"
+                    local mark=""
+                    [[ "${DEFAULT_TOKEN:-}" == "$profile" ]] && mark=" (default)"
+                    echo "  $profile: $masked$mark"
+                    found=1
+                fi
+            done < "$CONFIG_FILE"
+        fi
+        [[ "$found" -eq 0 ]] && echo "  (none — add with: nubox --token NAME TOKEN)"
+        return
+    fi
+
+    # Name only: show that token
+    if [[ -z "$token" ]]; then
+        local var="TOKEN_$name"
+        local val="${!var:-}"
+        [[ -z "$val" ]] && { echo "Token '$name' not found"; return 1; }
+        echo "$name: ${val:0:15}...${val: -4}"
+        return
+    fi
+
+    # Name + token: save it
+    [[ ! -f "$CONFIG_FILE" ]] && die "No config. Run 'nubox --setup' first."
+
+    if grep -q "^TOKEN_${name}=" "$CONFIG_FILE" 2>/dev/null; then
+        sed -i "s|^TOKEN_${name}=.*|TOKEN_${name}=\"${token}\"|" "$CONFIG_FILE"
+        echo "Updated token '$name'"
+    else
+        echo "TOKEN_${name}=\"${token}\"" >> "$CONFIG_FILE"
+        echo "Added token '$name'"
+    fi
+    source "$CONFIG_FILE"
+}
+
+resolve_token() {
+    local profile="${1:-${DEFAULT_TOKEN:-}}"
+    [[ -z "$profile" ]] && return
+    local var="TOKEN_$profile"
+    echo "${!var:-}"
+}
+
+# ============================================================================
+# Create a new box
+# ============================================================================
+
+cmd_new() {
+    local name="$1"
+    local token_profile="${2:-${DEFAULT_TOKEN:-}}"
+
+    validate_name "$name"
+    local box_path="$BOXES_DIR/$name"
+    [[ -d "$box_path" ]] && die "Box '$name' already exists"
+
+    # Determine username
+    local box_user="${DEFAULT_USER:-}"
+    if [[ -z "$box_user" ]]; then
+        read -rp "Username: [mr] " box_user
+        box_user="${box_user:-mr}"
+    fi
+
+    setup_host_network
+    mkdir -p "$BOXES_DIR"
+
+    echo "Creating '$name'..."
+    sudo debootstrap --variant=minbase "$DEFAULT_SUITE" "$box_path" "$DEFAULT_MIRROR"
+
+    # Packages
+    export DEBIAN_FRONTEND=noninteractive
+    local packages="systemd systemd-sysv dbus dbus-user-session iproute2 bash sudo"
+    [[ -n "$EXTRA_PACKAGES" ]] && packages="$packages $EXTRA_PACKAGES"
+    [[ -n "${INSTALL_SSHD:-}" ]] && packages="$packages openssh-server"
+
+    sudo DEBIAN_FRONTEND=noninteractive chroot "$box_path" apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive chroot "$box_path" apt-get install -y \
+        --no-install-recommends $packages > /dev/null
+
+    # Locale (suppress perl warnings)
+    if dpkg --root="$box_path" -l locales &>/dev/null; then
+        echo "en_US.UTF-8 UTF-8" | sudo tee "$box_path/etc/locale.gen" > /dev/null
+        sudo chroot "$box_path" locale-gen > /dev/null 2>&1 || true
+        echo "LANG=en_US.UTF-8" | sudo tee "$box_path/etc/default/locale" > /dev/null
+    fi
+
+    # User
+    echo "Setting up user '$box_user'..."
+    sudo chroot "$box_path" useradd -m -s /bin/bash "$box_user"
+    sudo chroot "$box_path" usermod -aG sudo "$box_user"
+    sudo chroot "$box_path" passwd -d "$box_user"
+    echo "$box_user ALL=(ALL) NOPASSWD: ALL" | sudo tee "$box_path/etc/sudoers.d/$box_user" > /dev/null
+    sudo chmod 440 "$box_path/etc/sudoers.d/$box_user"
+    echo "$box_user" | sudo tee "$box_path/.nubox-user" > /dev/null
+
+    # Linger
+    sudo mkdir -p "$box_path/var/lib/systemd/linger"
+    sudo touch "$box_path/var/lib/systemd/linger/$box_user"
+
+    # DNS
+    sudo tee "$box_path/etc/resolv.conf" > /dev/null <<'EOF'
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+EOF
+
+    # Auto-login
+    sudo mkdir -p "$box_path/etc/systemd/system/console-getty.service.d"
+    sudo tee "$box_path/etc/systemd/system/console-getty.service.d/autologin.conf" > /dev/null << AUTOLOGIN
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin $box_user --noclear --keep-baud console 115200,38400,9600 \$TERM
+AUTOLOGIN
+
+    sudo chroot "$box_path" passwd -d root
+
+    # Networking
+    sudo chroot "$box_path" systemctl enable systemd-networkd
+    [[ -n "${INSTALL_SSHD:-}" ]] && sudo chroot "$box_path" systemctl enable ssh
+    sudo mkdir -p "$box_path/etc/systemd/network"
+    sudo tee "$box_path/etc/systemd/network/80-container-host0.network" > /dev/null << 'NETCONF'
+[Match]
+Name=host0
+
+[Network]
+DHCP=ipv4
+DNS=8.8.8.8
+DNS=1.1.1.1
+NETCONF
+
+    # Hostname
+    echo "$name" | sudo tee "$box_path/etc/hostname" > /dev/null
+    echo "127.0.0.1 $name" | sudo tee -a "$box_path/etc/hosts" > /dev/null
+
+    # Bashrc
+    local user_home="$box_path/home/$box_user"
+    sudo tee -a "$user_home/.bashrc" > /dev/null << 'BASHCONF'
+
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+alias ll='ls -alt'
+alias shutdown='sudo /sbin/poweroff'
+BASHCONF
+
+    if [[ "${UNLIMITED_HISTORY:-}" == "true" ]]; then
+        sudo tee -a "$user_home/.bashrc" > /dev/null << HISTCONF
+HISTCONTROL=ignoreboth
+shopt -s histappend
+HISTSIZE=
+HISTFILESIZE=
+HISTTIMEFORMAT='${HISTTIMEFORMAT_FMT:-}'
+HISTCONF
+    fi
+
+    [[ -n "${CUSTOM_BASHRC:-}" ]] && [[ -f "$CUSTOM_BASHRC" ]] && \
+        sudo tee -a "$user_home/.bashrc" > /dev/null < "$CUSTOM_BASHRC"
+
+    sudo chroot "$box_path" chown "$box_user:$box_user" "/home/$box_user/.bashrc"
+
+    sudo tee "$user_home/.bash_profile" > /dev/null << 'BPEOF'
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+if [ -f ~/.bashrc ]; then . ~/.bashrc; fi
+BPEOF
+    sudo chroot "$box_path" chown "$box_user:$box_user" "/home/$box_user/.bash_profile"
+
+    # SSH keys
+    if [[ -n "${COPY_SSH_KEYS:-}" ]]; then
+        sudo mkdir -p "$user_home/.ssh"
+        for key in id_rsa id_rsa.pub id_ed25519 id_ed25519.pub; do
+            [[ -f "$HOME/.ssh/$key" ]] && sudo cp "$HOME/.ssh/$key" "$user_home/.ssh/$key"
+        done
+        [[ -f "$HOME/.ssh/id_rsa.pub" ]] && sudo cp "$HOME/.ssh/id_rsa.pub" "$user_home/.ssh/authorized_keys"
+        [[ -f "$HOME/.ssh/id_ed25519.pub" ]] && sudo cp "$HOME/.ssh/id_ed25519.pub" "$user_home/.ssh/authorized_keys"
+        [[ -f "$HOME/.ssh/authorized_keys" ]] && sudo cp "$HOME/.ssh/authorized_keys" "$user_home/.ssh/authorized_keys"
+        sudo chroot "$box_path" chown -R "$box_user:$box_user" "/home/$box_user/.ssh"
+        sudo chmod 700 "$user_home/.ssh"
+        sudo chmod 600 "$user_home/.ssh/"* 2>/dev/null || true
+    fi
+
+    # Mount for installs
+    sudo mount -t proc proc "$box_path/proc" 2>/dev/null || true
+    sudo mount -t sysfs sys "$box_path/sys" 2>/dev/null || true
+    sudo mount --bind /dev "$box_path/dev" 2>/dev/null || true
+    sudo mount -t devpts devpts "$box_path/dev/pts" 2>/dev/null || true
+
+    # Claude Code
+    if [[ "${INSTALL_CLAUDE:-}" == "true" ]]; then
+        echo "Installing Claude Code..."
+        sudo chroot "$box_path" su - "$box_user" -c \
+            "curl -fsSL https://claude.ai/install.sh | bash" > /dev/null 2>&1 || true
+        sudo tee -a "$user_home/.bashrc" > /dev/null <<< "alias cld='claude --dangerously-skip-permissions'"
+    fi
+
+    # OpenClaw
+    if [[ "${INSTALL_OPENCLAW:-}" == "true" ]]; then
+        echo "Installing OpenClaw..."
+        sudo chroot "$box_path" su - "$box_user" -c \
+            "mkdir -p ~/.npm-global && npm config set prefix ~/.npm-global && npm install -g openclaw" \
+            > /dev/null 2>&1 || true
+        sudo tee -a "$user_home/.bashrc" > /dev/null <<< "alias ok='openclaw tui'"
+    fi
+
+    # Auth tokens
+    local auth_token
+    auth_token=$(resolve_token "$token_profile")
+    if [[ -n "$auth_token" ]]; then
+        echo "Configuring auth ($token_profile)..."
+
+        if [[ "${INSTALL_CLAUDE:-}" == "true" ]]; then
+            sudo mkdir -p "$user_home/.claude"
+            sudo tee "$user_home/.claude/.credentials.json" > /dev/null << CREDEOF
+{
+  "claudeAiOauth": {
+    "accessToken": "$auth_token",
+    "refreshToken": "",
+    "expiresAt": 9999999999999,
+    "scopes": ["user:file_upload","user:inference","user:mcp_servers","user:profile","user:sessions:claude_code"],
+    "subscriptionType": "max",
+    "rateLimitTier": "default_claude_max_20x"
+  }
+}
+CREDEOF
+            sudo chroot "$box_path" chown -R "$box_user:$box_user" "/home/$box_user/.claude"
+        fi
+
+        if [[ "${INSTALL_OPENCLAW:-}" == "true" ]]; then
+            sudo mkdir -p "$user_home/.openclaw/agents/main/agent"
+            sudo tee "$user_home/.openclaw/agents/main/agent/auth-profiles.json" > /dev/null << OCAEOF
+{
+  "version": 1,
+  "profiles": {
+    "anthropic:default": {
+      "type": "token",
+      "provider": "anthropic",
+      "token": "$auth_token"
+    }
+  }
+}
+OCAEOF
+            sudo tee "$user_home/.openclaw/openclaw.json" > /dev/null << 'OCCEOF'
+{
+  "auth": {"profiles": {"anthropic:default": {"provider": "anthropic", "mode": "token"}}},
+  "agents": {"defaults": {"model": {"primary": "anthropic/claude-sonnet-4-6"}, "workspace": "~/.openclaw/workspace"}},
+  "gateway": {"port": 18789, "mode": "local", "bind": "loopback"},
+  "tools": {"exec": {"security": "full"}}
+}
+OCCEOF
+            sudo chroot "$box_path" chown -R "$box_user:$box_user" "/home/$box_user/.openclaw"
+        fi
+    fi
+
+    # Tailscale
+    if [[ -n "${TS_AUTH_KEY:-}" ]]; then
+        echo "Installing Tailscale..."
+        sudo chroot "$box_path" bash -c "curl -fsSL https://tailscale.com/install.sh | sh" > /dev/null 2>&1 || true
+        sudo chroot "$box_path" systemctl enable tailscaled 2>/dev/null || true
+
+        sudo tee "$box_path/etc/systemd/system/tailscale-up.service" > /dev/null << TSEOF
+[Unit]
+Description=Tailscale auto-join
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 5
+ExecStart=/bin/bash -c 'tailscale status --json 2>/dev/null | grep -q Running || tailscale up --authkey=${TS_AUTH_KEY} --hostname=${name} --ssh && tailscale set --operator=${box_user} --ssh --accept-risk=lose-ssh; tailscale set --key-expiry-disabled 2>/dev/null || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+TSEOF
+        sudo chroot "$box_path" systemctl enable tailscale-up 2>/dev/null || true
+    fi
+
+    # Cleanup mounts
+    sudo umount "$box_path/dev/pts" 2>/dev/null || true
+    sudo umount "$box_path/dev" 2>/dev/null || true
+    sudo umount "$box_path/sys" 2>/dev/null || true
+    sudo umount "$box_path/proc" 2>/dev/null || true
+
+    local size
+    size="$(sudo du -sh "$box_path" | cut -f1)"
+    echo ""
+    echo "Box '$name' created ($size)"
+    echo "  User: $box_user"
+    [[ -n "${INSTALL_SSHD:-}" ]] && echo "  SSH: enabled"
+    [[ -n "$auth_token" ]] && echo "  Auth: $token_profile"
+    [[ -n "${TS_AUTH_KEY:-}" ]] && echo "  Tailscale: joins as '$name'"
+    [[ -n "${INSTALL_CLAUDE:-}" ]] && echo "  Claude Code: installed"
+    [[ -n "${INSTALL_OPENCLAW:-}" ]] && echo "  OpenClaw: installed"
+    echo ""
+    echo "Start: nubox --start $name"
+}
+
+# ============================================================================
+# Start / Stop / Enter / Shell
+# ============================================================================
+
+cmd_start() {
+    local name="$1"
+    validate_name "$name"
+    local box_path="$BOXES_DIR/$name"
+    local user
+    user=$(box_user "$name")
+
+    [[ ! -d "$box_path" ]] && die "Box '$name' does not exist"
+    is_running "$name" && { echo "'$name' is already running"; return 0; }
+
+    setup_host_network
+
+    local bind_flags=""
+    local binds_file="$box_path/.nubox-binds"
+    if [[ -f "$binds_file" ]]; then
+        while IFS= read -r bp; do
+            [[ -n "$bp" ]] && bind_flags="$bind_flags --bind=$bp"
+        done < "$binds_file"
+    fi
+
+    echo "Booting '$name'..."
+    # shellcheck disable=SC2086
+    sudo systemd-nspawn \
+        -D "$box_path" \
+        --network-veth \
+        --boot \
+        --hostname="$name" \
+        --capability=all \
+        --bind=/dev/net/tun \
+        --system-call-filter= \
+        --machine="$name" \
+        $bind_flags \
+        > /dev/null 2>&1 &
+
+    echo -n "Waiting for boot"
+    local booted=0
+    for _ in $(seq 1 30); do
+        if is_running "$name"; then
+            echo " ready!"
+            booted=1
+            break
+        fi
+        echo -n "."; sleep 1
+    done
+    [[ "$booted" -eq 0 ]] && { echo " failed!"; return 1; }
+
+    sudo ip link set "ve-$name" up 2>/dev/null || true
+    sudo networkctl reload 2>/dev/null || true
+
+    if [[ -n "${TS_AUTH_KEY:-}" ]]; then
+        echo -n "Tailscale"
+        for _ in $(seq 1 20); do
+            local ts_ip
+            ts_ip=$(sudo nsenter -t "$(leader_pid "$name")" -a -- tailscale ip -4 2>/dev/null) || true
+            if [[ -n "$ts_ip" ]]; then
+                echo " $ts_ip"
+                sudo nsenter -t "$(leader_pid "$name")" -a -- \
+                    tailscale set --ssh --operator="$user" --accept-risk=lose-ssh 2>/dev/null || true
+                return 0
+            fi
+            echo -n "."; sleep 2
+        done
+        echo " timeout"
+    fi
+}
+
+cmd_stop() {
+    local name="$1"
+    validate_name "$name"
+    local pid
+    pid=$(leader_pid "$name")
+    [[ -z "$pid" || "$pid" -lt 2 ]] 2>/dev/null && { echo "'$name' is not running"; return 0; }
+    echo "Stopping '$name'..."
+    sudo machinectl terminate "$name" 2>/dev/null || true
+    sleep 2
+    sudo kill -9 "$pid" 2>/dev/null || true
+    echo "Stopped."
+}
+
+cmd_enter() {
+    local name="$1"
+    validate_name "$name"
+    local box_path="$BOXES_DIR/$name"
+    local user
+    user=$(box_user "$name")
+
+    [[ ! -d "$box_path" ]] && die "Box '$name' does not exist"
+    is_running "$name" || cmd_start "$name"
+
+    if ! sudo machinectl shell --setenv=TERM="$TERM" "$user@$name" /usr/bin/bash -il 2>/dev/null; then
+        local pid
+        pid=$(leader_pid "$name")
+        [[ -n "$pid" ]] && sudo nsenter -t "$pid" -a -- su -l "$user" || die "Cannot connect"
+    fi
+}
+
+cmd_shell() {
+    local name="$1"
+    validate_name "$name"
+    local user
+    user=$(box_user "$name")
+    is_running "$name" || die "'$name' is not running. Use 'nubox --start $name' first."
+
+    if ! sudo machinectl shell --setenv=TERM="$TERM" "$user@$name" /usr/bin/bash -il 2>/dev/null; then
+        local pid
+        pid=$(leader_pid "$name")
+        [[ -n "$pid" ]] && sudo nsenter -t "$pid" -a -- su -l "$user" || die "Cannot connect"
+    fi
+}
+
+# ============================================================================
+# Bind / Unbind
+# ============================================================================
+
+cmd_bind() {
+    local name="$1"
+    local host_path="${2:-$(pwd)}"
+    validate_name "$name"
+    local box_path="$BOXES_DIR/$name"
+
+    [[ ! -d "$box_path" ]] && die "Box '$name' does not exist"
+    host_path="$(cd "$host_path" 2>/dev/null && pwd)" || die "Path does not exist: $host_path"
+
+    local binds_file="$box_path/.nubox-binds"
+    grep -qxF "$host_path" "$binds_file" 2>/dev/null && { echo "Already bound: $host_path"; return 0; }
+
+    echo "$host_path" | sudo tee -a "$binds_file" > /dev/null
+    echo "Bound $host_path → $name"
+
+    if is_running "$name"; then
+        echo "Restarting '$name'..."
+        cmd_stop "$name"; sleep 1; cmd_start "$name"
+    fi
+}
+
+cmd_unbind() {
+    local name="$1"
+    local host_path="${2:-$(pwd)}"
+    validate_name "$name"
+    local box_path="$BOXES_DIR/$name"
+
+    [[ ! -d "$box_path" ]] && die "Box '$name' does not exist"
+    host_path="$(cd "$host_path" 2>/dev/null && pwd)" || host_path="${2:-$(pwd)}"
+
+    local binds_file="$box_path/.nubox-binds"
+    if [[ ! -f "$binds_file" ]] || ! grep -qxF "$host_path" "$binds_file" 2>/dev/null; then
+        echo "Not bound: $host_path"; return 0
+    fi
+
+    grep -vxF "$host_path" "$binds_file" | sudo tee "$binds_file.tmp" > /dev/null
+    sudo mv "$binds_file.tmp" "$binds_file"
+    echo "Unbound $host_path from $name"
+
+    if is_running "$name"; then
+        echo "Restarting '$name'..."
+        cmd_stop "$name"; sleep 1; cmd_start "$name"
+    fi
+}
+
+# ============================================================================
+# List
+# ============================================================================
+
+cmd_list() {
+    [[ ! -d "$BOXES_DIR" ]] || [[ -z "$(ls -A "$BOXES_DIR" 2>/dev/null)" ]] && { echo "No boxes"; return; }
+
+    printf "  %-20s %-10s %-8s %s\n" "NAME" "USER" "STATUS" "SIZE"
+    printf "  %-20s %-10s %-8s %s\n" "----" "----" "------" "----"
+    for box in "$BOXES_DIR"/*/; do
+        [[ -d "$box" ]] || continue
+        local n u s sz
+        n="$(basename "$box")"
+        u="$(box_user "$n")"
+        sz="$(sudo du -sh "$box" 2>/dev/null | cut -f1)"
+        is_running "$n" && s="running" || s="stopped"
+        printf "  %-20s %-10s %-8s %s\n" "$n" "$u" "$s" "$sz"
+    done
+}
+
+# ============================================================================
+# Remove
+# ============================================================================
+
+cmd_remove() {
+    local name="$1"
+    validate_name "$name"
+    local box_path="$BOXES_DIR/$name"
+
+    [[ ! -d "$box_path" ]] && die "Box '$name' does not exist"
+
+    if [[ "${FORCE_YES:-}" != "1" ]]; then
+        read -rp "Remove '$name'? [y/N] " confirm
+        [[ ! "$confirm" =~ ^[Yy]$ ]] && { echo "Cancelled"; return; }
+    fi
+
+    # Stop
+    local pid
+    pid=$(leader_pid "$name")
+    if [[ -n "$pid" ]] && [[ "$pid" -gt 1 ]] 2>/dev/null; then
+        echo "Stopping '$name'..."
+        sudo machinectl terminate "$name" 2>/dev/null || true
+        sleep 2
+        sudo kill -9 "$pid" 2>/dev/null || true
+        sleep 1
+    fi
+
+    # Tailscale cleanup
+    if [[ -n "${TS_API_KEY:-}" ]]; then
+        echo "Removing from Tailscale..."
+        local node_id
+        node_id=$(curl -sf -H "Authorization: Bearer $TS_API_KEY" \
+            "https://api.tailscale.com/api/v2/tailnet/-/devices" 2>/dev/null | \
+            python3 -c "
+import json,sys
+try:
+    for d in json.load(sys.stdin).get('devices',[]):
+        if d.get('hostname','').lower()=='${name}'.lower():
+            print(d['id']);break
+except:pass" 2>/dev/null) || true
+        [[ -n "$node_id" ]] && curl -sf -X DELETE \
+            -H "Authorization: Bearer $TS_API_KEY" \
+            "https://api.tailscale.com/api/v2/device/$node_id" > /dev/null 2>&1 || true
+    fi
+
+    sudo rm -rf "$box_path"
+    echo "Box '$name' removed"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+[[ $# -eq 0 ]] && interactive_menu && exit 0
+
+case "$1" in
+    -n|--new)
+        [[ $# -lt 2 ]] && die "Name required. Usage: nubox --new NAME"
+        new_name="$2"; shift 2
+        new_token="${DEFAULT_TOKEN:-}"; new_bind=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -t) [[ $# -lt 2 ]] && die "-t requires a profile name"; new_token="$2"; shift 2 ;;
+                -b) shift; if [[ $# -gt 0 && "${1:0:1}" != "-" ]]; then new_bind="$1"; shift; else new_bind="$(pwd)"; fi ;;
+                *) die "Unknown option: $1" ;;
+            esac
+        done
+        cmd_new "$new_name" "$new_token"
+        [[ -n "$new_bind" ]] && cmd_bind "$new_name" "$new_bind"
+        ;;
+    -sh|--shell)   [[ $# -lt 2 ]] && die "Name required"; cmd_shell "$2" ;;
+    -on|--start)   [[ $# -lt 2 ]] && die "Name required"; cmd_start "$2" ;;
+    -off|--stop)   [[ $# -lt 2 ]] && die "Name required"; cmd_stop "$2" ;;
+    -b|--bind)     [[ $# -lt 2 ]] && die "Name required"; cmd_bind "$2" "${3:-}" ;;
+    -ub|--unbind)  [[ $# -lt 2 ]] && die "Name required"; cmd_unbind "$2" "${3:-}" ;;
+    -ls|--list)    cmd_list ;;
+    -rm|--remove)
+        [[ $# -lt 2 ]] && die "Name required"
+        [[ "${3:-}" == "-y" ]] && FORCE_YES=1 cmd_remove "$2" || cmd_remove "$2" ;;
+    -t|--token)    cmd_token "${2:-}" "${3:-}" ;;
+    --setup)       cmd_setup ;;
+    -v|--version)  echo "nubox $VERSION" ;;
+    -h|--help)     usage ;;
+    -*)            die "Unknown option: $1" ;;
+    *)             cmd_enter "$1" ;;
+esac

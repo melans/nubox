@@ -1,0 +1,5 @@
+config
+BOXES/
+*.swp
+*.bak
+.DS_Store

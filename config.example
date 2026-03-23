@@ -1,0 +1,23 @@
+# nubox configuration
+# Copy this to 'config' and fill in your values
+
+# Directories
+BOXES_DIR="$HOME/nubox/BOXES"
+SYSTEM_DIR="$HOME/nubox/SYSTEM"
+
+# Debian settings
+DEFAULT_SUITE="stable"
+DEFAULT_MIRROR="http://deb.debian.org/debian"
+
+# Tailscale (optional — enables auto-join on box creation)
+# Get auth key: https://login.tailscale.com/admin/settings/keys
+# Get API key: https://login.tailscale.com/admin/settings/keys (for cleanup on remove)
+TS_AUTH_KEY=""
+TS_API_KEY=""
+
+# Auth tokens (optional — pre-configures Claude Code + OpenClaw in new boxes)
+# Format: TOKEN_<name>="<token>"
+# The default token is used when -t is not specified
+# TOKEN_personal="sk-ant-oat01-..."
+# TOKEN_work="sk-ant-oat01-..."
+# DEFAULT_TOKEN="personal"
